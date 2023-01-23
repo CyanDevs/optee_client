@@ -4,7 +4,8 @@ project (optee_client C)
 # https://cmake.org/Wiki/CMake_Useful_Variables
 set (CMAKE_TOOLCHAIN_FILE CMakeToolchain.txt)
 
-set (CFG_WERROR 1 CACHE BOOL "Build with -Werror")
+option (CFG_WERROR "Build with -Werror" TRUE)
+option (WITH_TEEACL "Build libteeacl" TRUE)
 
 include(GNUInstallDirs)
 
@@ -36,3 +37,10 @@ endif(CCACHE_FOUND)
 add_subdirectory (libteec)
 add_subdirectory (tee-supplicant)
 add_subdirectory (public)
+add_subdirectory (libckteec)
+if(WITH_TEEACL)
+    find_package (PkgConfig REQUIRED)
+    pkg_check_modules(uuid REQUIRED IMPORTED_TARGET uuid)
+    add_subdirectory (libteeacl)
+endif(WITH_TEEACL)
+add_subdirectory (libseteec)

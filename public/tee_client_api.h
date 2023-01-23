@@ -185,6 +185,7 @@ extern "C" {
 #define TEEC_ERROR_SHORT_BUFFER            0xFFFF0010
 #define TEEC_ERROR_EXTERNAL_CANCEL         0xFFFF0011
 #define TEEC_ERROR_TARGET_DEAD             0xFFFF3024
+#define TEEC_ERROR_STORAGE_NO_SPACE        0xFFFF3041
 
 /**
  * Function error origins, of type TEEC_ErrorOrigin. These indicate where in
@@ -256,6 +257,7 @@ typedef struct {
 	/* Implementation defined */
 	int fd;
 	bool reg_mem;
+	bool memref_null;
 } TEEC_Context;
 
 /**
@@ -297,7 +299,10 @@ typedef struct {
 	size_t alloced_size;
 	void *shadow_buffer;
 	int registered_fd;
-	bool buffer_allocated;
+	union {
+		bool dummy;
+		uint8_t flags;
+	} internal;
 } TEEC_SharedMemory;
 
 /**
@@ -389,7 +394,7 @@ typedef struct {
  *
  * @param   started     Client must initialize to zero if it needs to cancel
  *                      an operation about to be performed.
- * @param   paramTypes  Type of data passed. Use TEEC_PARAMS_TYPE macro to
+ * @param   paramTypes  Type of data passed. Use TEEC_PARAM_TYPES macro to
  *                      create the correct flags.
  *                      0 means TEEC_NONE is passed for all params.
  * @param   params      Array of parameters of type TEEC_Parameter.

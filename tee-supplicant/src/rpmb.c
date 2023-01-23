@@ -25,6 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/types.h>
 #include <linux/mmc/ioctl.h>
@@ -64,9 +65,11 @@ struct rpmb_req {
 };
 #define RPMB_REQ_DATA(req) ((void *)((struct rpmb_req *)(req) + 1))
 
+#define RPMB_CID_SZ 16
+
 /* Response to device info request */
 struct rpmb_dev_info {
-	uint8_t cid[16];
+	uint8_t cid[RPMB_CID_SZ];
 	uint8_t rpmb_size_mult;	/* EXT CSD-slice 168: RPMB Size */
 	uint8_t rel_wr_sec_c;	/* EXT CSD-slice 222: Reliable Write Sector */
 				/*                    Count */
@@ -93,6 +96,7 @@ struct rpmb_data_frame {
 #define RPMB_RESULT_GENERAL_FAILURE		0x01
 #define RPMB_RESULT_AUTH_FAILURE		0x02
 #define RPMB_RESULT_ADDRESS_FAILURE		0x04
+#define RPMB_RESULT_AUTH_KEY_NOT_PROGRAMMED	0x07
 	uint16_t msg_type;
 #define RPMB_MSG_TYPE_REQ_AUTH_KEY_PROGRAM		0x0001
 #define RPMB_MSG_TYPE_REQ_WRITE_COUNTER_VAL_READ	0x0002
@@ -116,7 +120,6 @@ static pthread_mutex_t rpmb_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define MMC_BLOCK_MAJOR	179
 
 /* mmc_ioc_cmd.opcode */
-#define MMC_SEND_EXT_CSD		 8
 #define MMC_READ_MULTIPLE_BLOCK		18
 #define MMC_WRITE_MULTIPLE_BLOCK	25
 
@@ -132,6 +135,9 @@ static pthread_mutex_t rpmb_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* mmc_ioc_cmd.write_flag */
 #define MMC_CMD23_ARG_REL_WR	(1 << 31) /* CMD23 reliable write */
+
+/* Maximum number of commands used in a multiple ioc command request */
+#define RPMB_MAX_IOC_MULTI_CMDS		3
 
 #ifndef RPMB_EMU
 
@@ -152,9 +158,10 @@ static int mmc_rpmb_fd(uint16_t dev_id)
 	static int fd = -1;
 	char path[PATH_MAX] = { 0 };
 
+	DMSG("dev_id = %u", dev_id);
 	if (fd < 0) {
 #ifdef __ANDROID__
-		snprintf(path, sizeof(path), "/dev/block/mmcblk%urpmb", dev_id);
+		snprintf(path, sizeof(path), "/dev/mmcblk%urpmb", dev_id);
 #else
 		snprintf(path, sizeof(path), "/dev/mmcblk%urpmb", dev_id);
 #endif
@@ -172,60 +179,214 @@ static int mmc_rpmb_fd(uint16_t dev_id)
 	return fd;
 }
 
-/* Open eMMC device dev_id */
-static int mmc_fd(uint16_t dev_id)
+/*
+ * Read @n bytes from @fd, takes care of short reads and EINTR.
+ * Adapted from “Advanced Programming In the UNIX Environment” by W. Richard
+ * Stevens and Stephen A. Rago, 2013, 3rd Edition, Addison-Wesley
+ * (EINTR handling was added)
+ */
+static ssize_t readn(int fd, void *ptr, size_t n)
 {
-	int fd = 0;
-	char path[PATH_MAX] = { 0 };
+	size_t nleft = n;
+	ssize_t nread = 0;
+	uint8_t *p = ptr;
 
-#ifdef __ANDROID__
-	snprintf(path, sizeof(path), "/dev/block/mmcblk%u", dev_id);
-#else
-	snprintf(path, sizeof(path), "/dev/mmcblk%u", dev_id);
-#endif
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		EMSG("Could not open %s (%s)", path, strerror(errno));
-
-	return fd;
+	while (nleft > 0) {
+		if ((nread = read(fd, p, nleft)) < 0) {
+			if (errno == EINTR)
+				continue;
+			if (nleft == n)
+				return -1; /* error, nothing read, return -1 */
+			else
+				break; /* error, return amount read so far */
+		} else if (nread == 0) {
+			break; /* EOF */
+		}
+		nleft -= nread;
+		p += nread;
+	}
+	return n - nleft; /* return >= 0 */
 }
 
-static void close_mmc_fd(int fd)
-{
-	close(fd);
-}
+/* Size of CID printed in hexadecimal */
+#define CID_STR_SZ (2 * RPMB_CID_SZ)
 
-/* Device Identification (CID) register is 16 bytes. It is read from sysfs. */
-static uint32_t read_cid(uint16_t dev_id, uint8_t *cid)
+static TEEC_Result read_cid_str(uint16_t dev_id, char cid[CID_STR_SZ + 1])
 {
 	TEEC_Result res = TEEC_ERROR_GENERIC;
 	char path[48] = { 0 };
-	char hex[3] = { 0 };
-	int st = 0;
 	int fd = 0;
-	int i = 0;
+	int st = 0;
 
 	snprintf(path, sizeof(path),
 		 "/sys/class/mmc_host/mmc%u/mmc%u:0001/cid", dev_id, dev_id);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return TEEC_ERROR_ITEM_NOT_FOUND;
+	st = readn(fd, cid, CID_STR_SZ);
+	if (st != CID_STR_SZ) {
+		EMSG("Read CID error");
+		if (errno)
+			EMSG("%s", strerror(errno));
+		res = TEEC_ERROR_NO_DATA;
+		goto out;
+	}
+	res = TEEC_SUCCESS;
+out:
+	close(fd);
+	return res;
+}
+
+static int hexchar2int(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+static int hexbyte2int(char *hex)
+{
+	int v1 = hexchar2int(hex[0]);
+	int v2 = hexchar2int(hex[1]);
+
+	if (v1 < 0 || v2 < 0)
+		return -1;
+	return 16 * v1 + v2;
+}
+
+/* Device Identification (CID) register is 16 bytes. It is read from sysfs. */
+static TEEC_Result read_cid(uint16_t dev_id, uint8_t *cid)
+{
+	TEEC_Result res = TEEC_ERROR_GENERIC;
+	char cid_str[CID_STR_SZ + 1] = { };
+	int i = 0;
+	int v = 0;
+
+	res = read_cid_str(dev_id, cid_str);
+	if (res)
+		return res;
+
+	for (i = 0; i < RPMB_CID_SZ; i++) {
+		v = hexbyte2int(cid_str + 2 * i);
+		if (v < 0) {
+			EMSG("Invalid CID string: %s", cid_str);
+			return TEEC_ERROR_NO_DATA;
+		}
+		cid[i] = v;
+	}
+	return TEEC_SUCCESS;
+}
+
+static TEEC_Result read_mmc_sysfs_hex(uint16_t dev_id, const char *file, uint8_t *value)
+{
+	TEEC_Result status = TEEC_SUCCESS;
+	char path[255] = { 0 };
+	char buf[255] = { 0 };
+	char *endp = buf;
+	int fd = 0;
+	int ret = 0;
+
+	snprintf(path, sizeof(path), "/sys/class/mmc_host/mmc%u/mmc%u:0001/%s",
+		 dev_id, dev_id, file);
+
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
 		EMSG("Could not open %s (%s)", path, strerror(errno));
 		return TEEC_ERROR_ITEM_NOT_FOUND;
 	}
 
-	for (i = 0; i < 16; i++) {
-		st = read(fd, hex, 2);
-		if (st < 0) {
-			EMSG("Read CID error (%s)", strerror(errno));
-			res = TEEC_ERROR_NO_DATA;
-			goto err;
-		}
-		cid[i] = (uint8_t)strtol(hex, NULL, 16);
+	ret = readn(fd, buf, sizeof(buf));
+	if (ret < 0) {
+		EMSG("Read error (%s)", strerror(errno));
+		status = TEEC_ERROR_NO_DATA;
+		goto out;
 	}
-	res = TEEC_SUCCESS;
-err:
+
+	errno = 0;
+	*value = strtol(buf, &endp, 16);
+	if (errno || endp == buf)
+		status = TEEC_ERROR_GENERIC;
+
+out:
 	close(fd);
-	return res;
+	return status;
+}
+
+static TEEC_Result read_size_mult(uint16_t dev_id, uint8_t *value)
+{
+	return read_mmc_sysfs_hex(dev_id, "raw_rpmb_size_mult", value);
+}
+
+static TEEC_Result read_rel_wr_sec_c(uint16_t dev_id, uint8_t *value)
+{
+	return read_mmc_sysfs_hex(dev_id, "rel_sectors", value);
+}
+
+/*
+ * - If --rpmb-cid is given, find the eMMC RPMB device number with the specified
+ * CID, cache the number, copy it to @ndev_id and return true. If not found
+ * return false.
+ * - If --rpmb-cid is not given, copy @dev_id to @ndev_id and return true.
+ */
+static bool remap_rpmb_dev_id(uint16_t dev_id, uint16_t *ndev_id)
+{
+	TEEC_Result res = TEEC_ERROR_GENERIC;
+	static bool found = false;
+	static bool err = false;
+	static uint16_t id = 0;
+	char cid[CID_STR_SZ + 1] = { };
+	struct dirent *dent = NULL;
+	DIR *dir = NULL;
+	int num = 0;
+
+	if (err || found)
+		goto out;
+
+	if (!supplicant_params.rpmb_cid) {
+		id = dev_id;
+		found = true;
+		goto out;
+	}
+
+	dir = opendir("/sys/class/mmc_host");
+	if (!dir) {
+		EMSG("Could not open /sys/class/mmc_host (%s)",
+		     strerror(errno));
+		err = true;
+		goto out;
+	}
+
+	while ((dent = readdir(dir))) {
+		if (sscanf(dent->d_name, "%*[^0123456789]%d", &num) != 1)
+			continue;
+		if (num > UINT16_MAX) {
+			EMSG("Too many MMC devices");
+			err = true;
+			break;
+		}
+		id = (uint16_t)num;
+		res = read_cid_str(id, cid);
+		if (res)
+			continue;
+		if (strcmp(cid, supplicant_params.rpmb_cid))
+			continue;
+		IMSG("RPMB device %s is at /dev/mmcblk%urpmb\n", cid, id);
+		found = true;
+		break;
+	}
+
+	closedir(dir);
+
+	if (!found)
+		err = true;
+out:
+	if (found)
+		*ndev_id = id;
+	return found;
 }
 
 #else /* RPMB_EMU */
@@ -235,7 +396,7 @@ err:
 /* Emulated rel_wr_sec_c value (reliable write size, *256 bytes) */
 #define EMU_RPMB_REL_WR_SEC_C	1
 /* Emulated rpmb_size_mult value (RPMB size, *128 kB) */
-#define EMU_RPMB_SIZE_MULT	1
+#define EMU_RPMB_SIZE_MULT	2
 
 #define EMU_RPMB_SIZE_BYTES	(EMU_RPMB_SIZE_MULT * 128 * 1024)
 
@@ -335,6 +496,11 @@ static bool is_hmac_valid(struct rpmb_emu *mem, struct rpmb_data_frame *frm,
 	return true;
 }
 
+static uint16_t gen_msb1st_result(uint8_t byte)
+{
+	return (uint16_t)byte << 8;
+}
+
 static uint16_t compute_hmac(struct rpmb_emu *mem, struct rpmb_data_frame *frm,
 			     size_t nfrm)
 {
@@ -345,7 +511,7 @@ static uint16_t compute_hmac(struct rpmb_emu *mem, struct rpmb_data_frame *frm,
 
 	if (!mem->key_set) {
 		EMSG("Cannot compute MAC (key not set)");
-		return RPMB_RESULT_GENERAL_FAILURE;
+		return gen_msb1st_result(RPMB_RESULT_AUTH_KEY_NOT_PROGRAMMED);
 	}
 
 	hmac_sha256_init(&ctx, mem->key, sizeof(mem->key));
@@ -354,7 +520,7 @@ static uint16_t compute_hmac(struct rpmb_emu *mem, struct rpmb_data_frame *frm,
 	frm--;
 	hmac_sha256_final(&ctx, frm->key_mac, 32);
 
-	return RPMB_RESULT_OK;
+	return gen_msb1st_result(RPMB_RESULT_OK);
 }
 
 static uint16_t ioctl_emu_mem_transfer(struct rpmb_emu *mem,
@@ -368,10 +534,10 @@ static uint16_t ioctl_emu_mem_transfer(struct rpmb_emu *mem,
 
 	if (start > mem->size || start + size > mem->size) {
 		EMSG("Transfer bounds exceeed emulated memory");
-		return RPMB_RESULT_ADDRESS_FAILURE;
+		return gen_msb1st_result(RPMB_RESULT_ADDRESS_FAILURE);
 	}
 	if (to_mmc && !is_hmac_valid(mem, frm, nfrm))
-		return RPMB_RESULT_AUTH_FAILURE;
+		return gen_msb1st_result(RPMB_RESULT_AUTH_FAILURE);
 
 	DMSG("Transferring %zu 256-byte data block%s %s MMC (block offset=%zu)",
 	     nfrm, (nfrm > 1) ? "s" : "", to_mmc ? "to" : "from", start / 256);
@@ -391,14 +557,14 @@ static uint16_t ioctl_emu_mem_transfer(struct rpmb_emu *mem,
 			frm[i].block_count = nfrm;
 			memcpy(frm[i].nonce, mem->nonce, 16);
 		}
-		frm[i].op_result = RPMB_RESULT_OK;
+		frm[i].op_result = gen_msb1st_result(RPMB_RESULT_OK);
 	}
 	dump_blocks(mem->last_op.address, nfrm, mem->buf + start, to_mmc);
 
 	if (!to_mmc)
 		compute_hmac(mem, frm, nfrm);
 
-	return RPMB_RESULT_OK;
+	return gen_msb1st_result(RPMB_RESULT_OK);
 }
 
 static void ioctl_emu_get_write_result(struct rpmb_emu *mem,
@@ -416,13 +582,13 @@ static uint16_t ioctl_emu_setkey(struct rpmb_emu *mem,
 {
 	if (mem->key_set) {
 		EMSG("Key already set");
-		return RPMB_RESULT_GENERAL_FAILURE;
+		return gen_msb1st_result(RPMB_RESULT_GENERAL_FAILURE);
 	}
 	dump_buffer("Setting key", frm->key_mac, 32);
 	memcpy(mem->key, frm->key_mac, 32);
 	mem->key_set = true;
 
-	return RPMB_RESULT_OK;
+	return gen_msb1st_result(RPMB_RESULT_OK);
 }
 
 static void ioctl_emu_get_keyprog_result(struct rpmb_emu *mem,
@@ -440,7 +606,6 @@ static void ioctl_emu_read_ctr(struct rpmb_emu *mem,
 	frm->msg_type = htons(RPMB_MSG_TYPE_RESP_WRITE_COUNTER_VAL_READ);
 	frm->write_counter = htonl(mem->write_counter);
 	memcpy(frm->nonce, mem->nonce, 16);
-	frm->op_result = RPMB_RESULT_OK;
 	frm->op_result = compute_hmac(mem, frm, 1);
 }
 
@@ -475,37 +640,17 @@ static uint32_t read_cid(uint16_t dev_id, uint8_t *cid)
 	return TEEC_SUCCESS;
 }
 
-static void ioctl_emu_set_ext_csd(uint8_t *ext_csd)
+/* A crude emulation of the MMC ioc commands we need for RPMB */
+static int ioctl_emu_cmd(int fd, struct mmc_ioc_cmd *cmd)
 {
-	ext_csd[168] = EMU_RPMB_SIZE_MULT;
-	ext_csd[222] = EMU_RPMB_REL_WR_SEC_C;
-}
-
-/* A crude emulation of the MMC ioctls we need for RPMB */
-static int ioctl_emu(int fd, unsigned long request, ...)
-{
-	struct mmc_ioc_cmd *cmd = NULL;
 	struct rpmb_data_frame *frm = NULL;
 	uint16_t msg_type = 0;
 	struct rpmb_emu *mem = mem_for_fd(fd);
-	va_list ap;
 
-	if (request != MMC_IOC_CMD) {
-		EMSG("Unsupported ioctl: 0x%lx", request);
-		return -1;
-	}
 	if (!mem)
 		return -1;
 
-	va_start(ap, request);
-	cmd = va_arg(ap, struct mmc_ioc_cmd *);
-	va_end(ap);
-
 	switch (cmd->opcode) {
-	case MMC_SEND_EXT_CSD:
-		ioctl_emu_set_ext_csd((uint8_t *)(uintptr_t)cmd->data_ptr);
-		break;
-
 	case MMC_WRITE_MULTIPLE_BLOCK:
 		frm = (struct rpmb_data_frame *)(uintptr_t)cmd->data_ptr;
 		msg_type = ntohs(frm->msg_type);
@@ -570,6 +715,38 @@ static int ioctl_emu(int fd, unsigned long request, ...)
 	return 0;
 }
 
+static int ioctl_emu(int fd, unsigned long request, ...)
+{
+	struct mmc_ioc_multi_cmd *mcmd = NULL;
+	struct mmc_ioc_cmd *cmd = NULL;
+	size_t i = 0;
+	int res = 0;
+	va_list ap;
+
+	if (request == MMC_IOC_CMD) {
+		va_start(ap, request);
+		cmd = va_arg(ap, struct mmc_ioc_cmd *);
+		va_end(ap);
+
+		res = ioctl_emu_cmd(fd, cmd);
+	} else if (request == MMC_IOC_MULTI_CMD) {
+		va_start(ap, request);
+		mcmd = va_arg(ap, struct mmc_ioc_multi_cmd *);
+		va_end(ap);
+
+		for (i = 0; i < mcmd->num_of_cmds; i++) {
+			res = ioctl_emu_cmd(fd, &mcmd->cmds[i]);
+			if (res)
+				return res;
+		}
+	} else {
+		EMSG("Unsupported ioctl: 0x%lx", request);
+		return -1;
+	}
+
+	return res;
+}
+
 static int mmc_rpmb_fd(uint16_t dev_id)
 {
 	(void)dev_id;
@@ -578,58 +755,50 @@ static int mmc_rpmb_fd(uint16_t dev_id)
 	return 0;
 }
 
-static int mmc_fd(uint16_t dev_id)
+static TEEC_Result read_size_mult(uint16_t dev_id, uint8_t *value)
 {
 	(void)dev_id;
 
-	return 0;
+	*value = EMU_RPMB_SIZE_MULT;
+	return TEEC_SUCCESS;
 }
 
-static void close_mmc_fd(int fd)
+static TEEC_Result read_rel_wr_sec_c(uint16_t dev_id, uint8_t *value)
 {
-	(void)fd;
+	(void)dev_id;
+
+	*value = EMU_RPMB_REL_WR_SEC_C;
+	return TEEC_SUCCESS;
+}
+
+static bool remap_rpmb_dev_id(uint16_t dev_id, uint16_t *ndev_id)
+{
+	*ndev_id = dev_id;
+	return true;
 }
 
 #endif /* RPMB_EMU */
 
-/*
- * Extended CSD Register is 512 bytes and defines device properties
- * and selected modes.
- */
-static uint32_t read_ext_csd(int fd, uint8_t *ext_csd)
+static inline void set_mmc_io_cmd(struct mmc_ioc_cmd *cmd, unsigned int blocks,
+				  __u32 opcode, int write_flag)
 {
-	int st = 0;
-	struct mmc_ioc_cmd cmd = {
-		.blksz = 512,
-		.blocks = 1,
-		.flags = MMC_RSP_R1 | MMC_CMD_ADTC,
-		.opcode = MMC_SEND_EXT_CSD,
-	};
-
-	mmc_ioc_cmd_set_data(cmd, ext_csd);
-
-	st = IOCTL(fd, MMC_IOC_CMD, &cmd);
-	if (st < 0)
-		return TEEC_ERROR_GENERIC;
-
-	return TEEC_SUCCESS;
+	cmd->blksz = 512;
+	cmd->blocks = blocks;
+	cmd->flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+	cmd->opcode = opcode;
+	cmd->write_flag = write_flag;
 }
 
 static uint32_t rpmb_data_req(int fd, struct rpmb_data_frame *req_frm,
 			      size_t req_nfrm, struct rpmb_data_frame *rsp_frm,
 			      size_t rsp_nfrm)
 {
+	TEEC_Result res = TEEC_SUCCESS;
 	int st = 0;
 	size_t i = 0;
 	uint16_t msg_type = ntohs(req_frm->msg_type);
-	struct mmc_ioc_cmd cmd = {
-		.blksz = 512,
-		.blocks = req_nfrm,
-		.data_ptr = (uintptr_t)req_frm,
-		.flags = MMC_RSP_R1 | MMC_CMD_ADTC,
-		.opcode = MMC_WRITE_MULTIPLE_BLOCK,
-		.write_flag = 1,
-	};
+	struct mmc_ioc_multi_cmd *mcmd = NULL;
+	struct mmc_ioc_cmd *cmd = NULL;
 
 	for (i = 1; i < req_nfrm; i++) {
 		if (req_frm[i].msg_type != msg_type) {
@@ -641,52 +810,55 @@ static uint32_t rpmb_data_req(int fd, struct rpmb_data_frame *req_frm,
 	DMSG("Req: %zu frame(s) of type 0x%04x", req_nfrm, msg_type);
 	DMSG("Rsp: %zu frame(s)", rsp_nfrm);
 
+	mcmd = (struct mmc_ioc_multi_cmd *)
+		calloc(1, sizeof(struct mmc_ioc_multi_cmd) +
+			RPMB_MAX_IOC_MULTI_CMDS * sizeof(struct mmc_ioc_cmd));
+	if (!mcmd)
+		return TEEC_ERROR_OUT_OF_MEMORY;
+
 	switch(msg_type) {
 	case RPMB_MSG_TYPE_REQ_AUTH_KEY_PROGRAM:
 	case RPMB_MSG_TYPE_REQ_AUTH_DATA_WRITE:
 		if (rsp_nfrm != 1) {
 			EMSG("Expected only one response frame");
-			return TEEC_ERROR_BAD_PARAMETERS;
+			res = TEEC_ERROR_BAD_PARAMETERS;
+			goto out;
 		}
 
+		mcmd->num_of_cmds = 3;
+
 		/* Send write request frame(s) */
-		cmd.write_flag |= MMC_CMD23_ARG_REL_WR;
+		cmd = &mcmd->cmds[0];
+		set_mmc_io_cmd(cmd, req_nfrm, MMC_WRITE_MULTIPLE_BLOCK,
+			       1 | MMC_CMD23_ARG_REL_WR);
 		/*
 		 * Black magic: tested on a HiKey board with a HardKernel eMMC
 		 * module. When postsleep values are zero, the kernel logs
 		 * random errors: "mmc_blk_ioctl_cmd: Card Status=0x00000E00"
 		 * and ioctl() fails.
 		 */
-		cmd.postsleep_min_us = 20000;
-		cmd.postsleep_max_us = 50000;
-		st = IOCTL(fd, MMC_IOC_CMD, &cmd);
-		if (st < 0)
-			return TEEC_ERROR_GENERIC;
-		cmd.postsleep_min_us = 0;
-		cmd.postsleep_max_us = 0;
+		cmd->postsleep_min_us = 20000;
+		cmd->postsleep_max_us = 50000;
+		mmc_ioc_cmd_set_data((*cmd), (uintptr_t)req_frm);
 
 		/* Send result request frame */
+		cmd = &mcmd->cmds[1];
+		set_mmc_io_cmd(cmd, req_nfrm, MMC_WRITE_MULTIPLE_BLOCK, 1);
 		memset(rsp_frm, 0, 1);
 		rsp_frm->msg_type = htons(RPMB_MSG_TYPE_REQ_RESULT_READ);
-		cmd.data_ptr = (uintptr_t)rsp_frm;
-		cmd.write_flag &= ~MMC_CMD23_ARG_REL_WR;
-		st = IOCTL(fd, MMC_IOC_CMD, &cmd);
-		if (st < 0)
-			return TEEC_ERROR_GENERIC;
+		mmc_ioc_cmd_set_data((*cmd), (uintptr_t)rsp_frm);
 
 		/* Read response frame */
-		cmd.opcode = MMC_READ_MULTIPLE_BLOCK;
-		cmd.write_flag = 0;
-		cmd.blocks = rsp_nfrm;
-		st = IOCTL(fd, MMC_IOC_CMD, &cmd);
-		if (st < 0)
-			return TEEC_ERROR_GENERIC;
+		cmd = &mcmd->cmds[2];
+		set_mmc_io_cmd(cmd, rsp_nfrm, MMC_READ_MULTIPLE_BLOCK, 0);
+		mmc_ioc_cmd_set_data((*cmd), (uintptr_t)rsp_frm);
 		break;
 
 	case RPMB_MSG_TYPE_REQ_WRITE_COUNTER_VAL_READ:
 		if (rsp_nfrm != 1) {
 			EMSG("Expected only one response frame");
-			return TEEC_ERROR_BAD_PARAMETERS;
+			res = TEEC_ERROR_BAD_PARAMETERS;
+			goto out;
 		}
 #if __GNUC__ > 6
 		__attribute__((fallthrough));
@@ -695,56 +867,61 @@ static uint32_t rpmb_data_req(int fd, struct rpmb_data_frame *req_frm,
 	case RPMB_MSG_TYPE_REQ_AUTH_DATA_READ:
 		if (req_nfrm != 1) {
 			EMSG("Expected only one request frame");
-			return TEEC_ERROR_BAD_PARAMETERS;
+			res = TEEC_ERROR_BAD_PARAMETERS;
+			goto out;
 		}
 
+		mcmd->num_of_cmds = 2;
+
 		/* Send request frame */
-		st = IOCTL(fd, MMC_IOC_CMD, &cmd);
-		if (st < 0)
-			return TEEC_ERROR_GENERIC;
+		cmd = &mcmd->cmds[0];
+		set_mmc_io_cmd(cmd, req_nfrm, MMC_WRITE_MULTIPLE_BLOCK, 1);
+		mmc_ioc_cmd_set_data((*cmd), (uintptr_t)req_frm);
 
 		/* Read response frames */
-		cmd.data_ptr = (uintptr_t)rsp_frm;
-		cmd.opcode = MMC_READ_MULTIPLE_BLOCK;
-		cmd.write_flag = 0;
-		cmd.blocks = rsp_nfrm;
-		st = IOCTL(fd, MMC_IOC_CMD, &cmd);
-		if (st < 0)
-			return TEEC_ERROR_GENERIC;
+		cmd = &mcmd->cmds[1];
+		set_mmc_io_cmd(cmd, rsp_nfrm, MMC_READ_MULTIPLE_BLOCK, 0);
+		mmc_ioc_cmd_set_data((*cmd), (uintptr_t)rsp_frm);
 		break;
 
 	default:
 		EMSG("Unsupported message type: %d", msg_type);
-		return TEEC_ERROR_GENERIC;
+		res = TEEC_ERROR_GENERIC;
+		goto out;
 	}
 
-	return TEEC_SUCCESS;
+	st = IOCTL(fd, MMC_IOC_MULTI_CMD, mcmd);
+	if (st < 0)
+		res = TEEC_ERROR_GENERIC;
+
+out:
+	free(mcmd);
+
+	return res;
 }
 
 static uint32_t rpmb_get_dev_info(uint16_t dev_id, struct rpmb_dev_info *info)
 {
-	int fd = 0;
-	uint32_t res = 0;
-	uint8_t ext_csd[512] = { 0 };
+	TEEC_Result res = TEEC_SUCCESS;
+	uint8_t rpmb_size_mult = 0;
+	uint8_t rel_wr_sec_c = 0;
 
 	res = read_cid(dev_id, info->cid);
 	if (res != TEEC_SUCCESS)
 		return res;
 
-	fd = mmc_fd(dev_id);
-	if (fd < 0)
-		return TEEC_ERROR_BAD_PARAMETERS;
-
-	res = read_ext_csd(fd, ext_csd);
+	res = read_size_mult(dev_id, &rpmb_size_mult);
 	if (res != TEEC_SUCCESS)
-		goto err;
+		return res;
+	info->rpmb_size_mult = rpmb_size_mult;
 
-	info->rel_wr_sec_c = ext_csd[222];
-	info->rpmb_size_mult = ext_csd[168];
+	res = read_rel_wr_sec_c(dev_id, &rel_wr_sec_c);
+	if (res != TEEC_SUCCESS)
+		return res;
+	info->rel_wr_sec_c = rel_wr_sec_c;
+
 	info->ret_code = RPMB_CMD_GET_DEV_INFO_RET_OK;
 
-err:
-	close_mmc_fd(fd);
 	return res;
 }
 
@@ -759,17 +936,21 @@ static uint32_t rpmb_process_request_unlocked(void *req, size_t req_size,
 	struct rpmb_req *sreq = req;
 	size_t req_nfrm = 0;
 	size_t rsp_nfrm = 0;
+	uint16_t dev_id = 0;
 	uint32_t res = 0;
 	int fd = 0;
 
 	if (req_size < sizeof(*sreq))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
+	if (!remap_rpmb_dev_id(sreq->dev_id, &dev_id))
+		return TEEC_ERROR_ITEM_NOT_FOUND;
+
 	switch (sreq->cmd) {
 	case RPMB_CMD_DATA_REQ:
 		req_nfrm = (req_size - sizeof(struct rpmb_req)) / 512;
 		rsp_nfrm = rsp_size / 512;
-		fd = mmc_rpmb_fd(sreq->dev_id);
+		fd = mmc_rpmb_fd(dev_id);
 		if (fd < 0)
 			return TEEC_ERROR_BAD_PARAMETERS;
 		res = rpmb_data_req(fd, RPMB_REQ_DATA(req), req_nfrm, rsp,
@@ -782,8 +963,7 @@ static uint32_t rpmb_process_request_unlocked(void *req, size_t req_size,
 			EMSG("Invalid req/rsp size");
 			return TEEC_ERROR_BAD_PARAMETERS;
 		}
-		res = rpmb_get_dev_info(sreq->dev_id,
-					(struct rpmb_dev_info *)rsp);
+		res = rpmb_get_dev_info(dev_id, (struct rpmb_dev_info *)rsp);
 		break;
 
 	default:

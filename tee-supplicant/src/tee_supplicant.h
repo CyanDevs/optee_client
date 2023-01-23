@@ -31,7 +31,22 @@
 #include <stdbool.h>
 #include <pthread.h>
 
+/* Helpers to access memref parts of a struct tee_ioctl_param */
+#define MEMREF_SHM_ID(p)	((p)->c)
+#define MEMREF_SHM_OFFS(p)	((p)->a)
+#define MEMREF_SIZE(p)		((p)->b)
+
 struct tee_ioctl_param;
+
+/* Global tee-supplicant parameters */
+struct tee_supplicant_params {
+    const char *ta_dir;
+    const char *plugin_load_path;
+    const char *fs_parent_path;
+    const char *rpmb_cid;
+};
+
+extern struct tee_supplicant_params supplicant_params;
 
 bool tee_supp_param_is_memref(struct tee_ioctl_param *param);
 bool tee_supp_param_is_value(struct tee_ioctl_param *param);

@@ -31,8 +31,10 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <prof.h>
+#include <plugin.h>
 #include <pthread.h>
 #include <rpmb.h>
 #include <stdbool.h>
@@ -65,6 +67,9 @@
 #define RPC_BUF_SIZE	(sizeof(struct tee_iocl_supp_send_arg) + \
 			 RPC_NUM_PARAMS * sizeof(struct tee_ioctl_param))
 
+char **ta_path;
+char *ta_path_str;
+
 union tee_rpc_invoke {
 	uint64_t buf[(RPC_BUF_SIZE - 1) / sizeof(uint64_t) + 1];
 	struct tee_iocl_supp_recv_arg recv;
@@ -88,10 +93,22 @@ struct thread_arg {
 	pthread_mutex_t mutex;
 };
 
+struct param_value {
+	uint64_t a;
+	uint64_t b;
+	uint64_t c;
+};
+
 static pthread_mutex_t shm_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct tee_shm *shm_head;
 
-static const char *ta_dir;
+struct tee_supplicant_params supplicant_params = {
+	.ta_dir = "optee_armtz",
+#ifdef TEE_PLUGIN_LOAD_PATH
+	.plugin_load_path = TEE_PLUGIN_LOAD_PATH,
+#endif
+	.fs_parent_path  = TEE_FS_PARENT_PATH,
+};
 
 static void *thread_main(void *a);
 
@@ -121,8 +138,18 @@ static size_t num_waiters_dec(struct thread_arg *arg)
 	return ret;
 }
 
+static void *paged_aligned_alloc(size_t sz)
+{
+	void *p = NULL;
+
+	if (!posix_memalign(&p, sysconf(_SC_PAGESIZE), sz))
+		return p;
+
+	return NULL;
+}
+
 static int get_value(size_t num_params, struct tee_ioctl_param *params,
-		     const uint32_t idx, struct tee_ioctl_param_value **value)
+		     const uint32_t idx, struct param_value **value)
 {
 	if (idx >= num_params)
 		return -1;
@@ -131,7 +158,7 @@ static int get_value(size_t num_params, struct tee_ioctl_param *params,
 	case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT:
 	case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
 	case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
-		*value = &params[idx].u.value;
+		*value = (void *)&params[idx].a;
 		return 0;
 	default:
 		return -1;
@@ -198,6 +225,8 @@ static int get_param(size_t num_params, struct tee_ioctl_param *params,
 		     const uint32_t idx, TEEC_SharedMemory *shm)
 {
 	struct tee_shm *tshm = NULL;
+	size_t offs = 0;
+	size_t sz = 0;
 
 	if (idx >= num_params)
 		return -1;
@@ -213,7 +242,7 @@ static int get_param(size_t num_params, struct tee_ioctl_param *params,
 
 	memset(shm, 0, sizeof(*shm));
 
-	tshm = find_tshm(params[idx].u.memref.shm_id);
+	tshm = find_tshm(MEMREF_SHM_ID(params + idx));
 	if (!tshm) {
 		/*
 		 * It doesn't make sense to query required size of an
@@ -229,17 +258,19 @@ static int get_param(size_t num_params, struct tee_ioctl_param *params,
 		 */
 		return 0;
 	}
-	if ((params[idx].u.memref.size + params[idx].u.memref.shm_offs) <
-	    params[idx].u.memref.size)
+
+	sz = MEMREF_SIZE(params + idx);
+	offs = MEMREF_SHM_OFFS(params + idx);
+	if ((sz + offs) < sz)
 		return -1;
-	if ((params[idx].u.memref.size + params[idx].u.memref.shm_offs) >
-	    tshm->size)
+	if ((sz + offs) > tshm->size)
 		return -1;
 
 	shm->flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
-	shm->size = params[idx].u.memref.size - params[idx].u.memref.shm_offs;
-	shm->id = params[idx].u.memref.shm_id;
-	shm->buffer = (uint8_t *)tshm->p + params[idx].u.memref.shm_offs;
+	shm->size = sz;
+	shm->id = MEMREF_SHM_ID(params + idx);
+	shm->buffer = (uint8_t *)tshm->p + offs;
+
 	return 0;
 }
 
@@ -255,7 +286,7 @@ static uint32_t load_ta(size_t num_params, struct tee_ioctl_param *params)
 {
 	int ta_found = 0;
 	size_t size = 0;
-	struct tee_ioctl_param_value *val_cmd = NULL;
+	struct param_value *val_cmd = NULL;
 	TEEC_UUID uuid;
 	TEEC_SharedMemory shm_ta;
 
@@ -269,13 +300,13 @@ static uint32_t load_ta(size_t num_params, struct tee_ioctl_param *params)
 	uuid_from_octets(&uuid, (void *)val_cmd);
 
 	size = shm_ta.size;
-	ta_found = TEECI_LoadSecureModule(ta_dir, &uuid, shm_ta.buffer, &size);
+	ta_found = TEECI_LoadSecureModule(supplicant_params.ta_dir, &uuid, shm_ta.buffer, &size);
 	if (ta_found != TA_BINARY_FOUND) {
 		EMSG("  TA not found");
 		return TEEC_ERROR_ITEM_NOT_FOUND;
 	}
 
-	params[1].u.memref.size = size;
+	MEMREF_SIZE(params + 1) = size;
 
 	/*
 	 * If a buffer wasn't provided, just tell which size it should be.
@@ -326,7 +357,7 @@ static struct tee_shm *register_local_shm(int fd, size_t size)
 
 	memset(&data, 0, sizeof(data));
 
-	buf = malloc(size);
+	buf = paged_aligned_alloc(size);
 	if (!buf)
 		return NULL;
 
@@ -356,7 +387,7 @@ static struct tee_shm *register_local_shm(int fd, size_t size)
 static uint32_t process_alloc(struct thread_arg *arg, size_t num_params,
 			      struct tee_ioctl_param *params)
 {
-	struct tee_ioctl_param_value *val = NULL;
+	struct param_value *val = NULL;
 	struct tee_shm *shm = NULL;
 
 	if (num_params != 1 || get_value(num_params, params, 0, &val))
@@ -379,7 +410,7 @@ static uint32_t process_alloc(struct thread_arg *arg, size_t num_params,
 
 static uint32_t process_free(size_t num_params, struct tee_ioctl_param *params)
 {
-	struct tee_ioctl_param_value *val = NULL;
+	struct param_value *val = NULL;
 	struct tee_shm *shm = NULL;
 	int id = 0;
 
@@ -392,19 +423,18 @@ static uint32_t process_free(size_t num_params, struct tee_ioctl_param *params)
 	if (!shm)
 		return TEEC_ERROR_BAD_PARAMETERS;
 
+	close(shm->fd);
 	if (shm->registered) {
 		free(shm->p);
 	} else  {
 		if (munmap(shm->p, shm->size) != 0) {
 			EMSG("munmap(%p, %zu) failed - Error = %s",
 			     shm->p, shm->size, strerror(errno));
-			close(shm->fd);
 			free(shm);
 			return TEEC_ERROR_BAD_PARAMETERS;
 		}
 	}
 
-	close(shm->fd);
 	free(shm);
 	return TEEC_SUCCESS;
 }
@@ -432,7 +462,6 @@ static int open_dev(const char *devname, uint32_t *gen_caps)
 	if (vers.impl_id != TEE_IMPL_ID_OPTEE)
 		goto err;
 
-	ta_dir = "optee_armtz";
 	if (gen_caps)
 		*gen_caps = vers.gen_caps;
 
@@ -460,9 +489,18 @@ static int get_dev_fd(uint32_t *gen_caps)
 
 static int usage(int status)
 {
-	fprintf(stderr, "Usage: tee-supplicant [-d] [<device-name>]\n");
-	fprintf(stderr, "       -d: run as a daemon (fork after successful "
-			"initialization)\n");
+	fprintf(stderr, "Usage: tee-supplicant [options] [<device-name>]\n");
+	fprintf(stderr, "\t-h, --help: this help\n");
+	fprintf(stderr, "\t-d, --daemonize: run as a daemon (fork and return "
+			"after child has opened the TEE device or on error)\n");
+	fprintf(stderr, "\t-f, --fs-parent-path: secure fs parent path [%s]\n",
+			supplicant_params.fs_parent_path);
+	fprintf(stderr, "\t-t, --ta-dir: TAs dirname under %s [%s]\n", TEEC_LOAD_PATH,
+			supplicant_params.ta_dir);
+	fprintf(stderr, "\t-p, --plugin-path: plugin load path [%s]\n",
+			supplicant_params.plugin_load_path);
+	fprintf(stderr, "\t-r, --rpmb-cid: RPMB device identification register "
+			"(CID) in hexadecimal\n");
 	return status;
 }
 
@@ -505,7 +543,7 @@ static bool write_response(int fd, union tee_rpc_invoke *request)
 	data.buf_ptr = (uintptr_t)&request->send;
 	data.buf_len = sizeof(struct tee_iocl_supp_send_arg) +
 		       sizeof(struct tee_ioctl_param) *
-				request->send.num_params;
+				(__u64)request->send.num_params;
 	if (ioctl(fd, TEE_IOC_SUPPL_SEND, &data)) {
 		EMSG("TEE_IOC_SUPPL_SEND: %s", strerror(errno));
 		return false;
@@ -626,6 +664,9 @@ static bool process_one_request(struct thread_arg *arg)
 	case OPTEE_MSG_RPC_CMD_FTRACE:
 		ret = prof_process(num_params, params, "ftrace-");
 		break;
+	case OPTEE_MSG_RPC_CMD_PLUGIN:
+		ret = plugin_process(num_params, params);
+		break;
 	default:
 		EMSG("Cmd [0x%" PRIx32 "] not supported", func);
 		/* Not supported. */
@@ -655,13 +696,106 @@ static void *thread_main(void *a)
 	return NULL;
 }
 
+#define TEEC_TEST_LOAD_PATH "/foo:/bar::/baz"
+
+static void set_ta_path(void)
+{
+	char *p = NULL;
+	char *saveptr = NULL;
+	const char *path = (char *)
+#ifdef TEEC_TEST_LOAD_PATH
+		TEEC_TEST_LOAD_PATH ":"
+#endif
+		TEEC_LOAD_PATH;
+	size_t n = 0;
+
+	ta_path_str = strdup(path);
+	if (!ta_path_str)
+		goto err;
+
+	p = ta_path_str;
+	while (strtok_r(p, ":", &saveptr)) {
+		p = NULL;
+		n++;
+	}
+	n++; /* NULL terminator */
+
+	ta_path = malloc(n * sizeof(char *));
+	if (!ta_path)
+		goto err;
+
+	n = 0;
+	strcpy(ta_path_str, path);
+	p = ta_path_str;
+	while ((ta_path[n++] = strtok_r(p, ":", &saveptr)))
+	       p = NULL;
+
+	return;
+err:
+	EMSG("out of memory");
+	exit(EXIT_FAILURE);
+}
+
+/*
+ * Similar to the standard libc function daemon(0, 0) but the parent process
+ * issues a blocking read on pipefd[0] before exiting.
+ * Returns 0 on success, <0 on error.
+ */
+static int make_daemon(int pipefd[2])
+{
+	int fd = 0;
+	char c = 0;
+	int n = 0;
+
+	switch (fork()) {
+	case -1:
+		return -1;
+	case 0:
+		/* In child */
+		close(pipefd[0]);
+		break;
+	default:
+		/* In parent */
+		close(pipefd[1]);
+		n = read(pipefd[0], &c, 1);
+		close(pipefd[0]);
+		if (!n) {
+			/*
+			 * Nothing has been read: child has closed without
+			 * writing (either exited on error or crashed)
+			 */
+			return -1;
+		}
+		/* Child is done with the opening of the TEE device */
+		_exit(EXIT_SUCCESS);
+	}
+
+	if (setsid() < 0)
+		return -2;
+
+	if (chdir("/") < 0)
+		return -3;
+
+	fd = open("/dev/null", O_RDWR);
+	if (fd < 0)
+		return -4;
+	dup2(fd, 0);
+	dup2(fd, 1);
+	dup2(fd, 2);
+	close(fd);
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	struct thread_arg arg = { .fd = -1 };
+	int pipefd[2] = { 0, };
 	bool daemonize = false;
 	char *dev = NULL;
 	int e = 0;
-	int i = 0;
+	int long_index = 0;
+	int opt = 0;
 
 	e = pthread_mutex_init(&arg.mutex, NULL);
 	if (e) {
@@ -670,16 +804,72 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	if (argc > 3)
-		return usage(EXIT_FAILURE);
+	static struct option long_options[] = {
+		/* long name      | has argument  | flag | short value */
+		{ "help",            no_argument,       0, 'h' },
+		{ "daemonize",       no_argument,       0, 'd' },
+		{ "fs-parent-path",  required_argument, 0, 'f' },
+		{ "ta-dir",          required_argument, 0, 't' },
+		{ "plugin-path",     required_argument, 0, 'p' },
+		{ "rpmb-cid",        required_argument, 0, 'r' },
+		{ 0, 0, 0, 0 }
+	};
 
-	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "-d"))
-			daemonize = true;
-		else if (!strcmp(argv[i], "-h"))
-			return usage(EXIT_SUCCESS);
-		else
-			dev = argv[i];
+	while ((opt = getopt_long(argc, argv, "hdf:t:p:r:",
+				long_options, &long_index )) != -1) {
+		switch (opt) {
+			case 'h' :
+				return usage(EXIT_SUCCESS);
+				break;
+			case 'd':
+				daemonize = true;
+				break;
+			case 'f':
+				supplicant_params.fs_parent_path = optarg;
+				break;
+			case 't':
+				supplicant_params.ta_dir = optarg;
+				break;
+			case 'p':
+				supplicant_params.plugin_load_path = optarg;
+				break;
+			case 'r':
+				supplicant_params.rpmb_cid = optarg;
+				break;
+			default:
+				return usage(EXIT_FAILURE);
+		}
+	}
+	/* check for non option argument, which is device name */
+	if (argv[optind]) {
+		fprintf(stderr, "Using device %s.\n", argv[optind]);
+		dev = argv[optind];
+		/* check that we do not have too many arguments */
+		if (argv[optind + 1]) {
+			fprintf(stderr, "Too many arguments passed: extra argument: %s.\n",
+					argv[optind+1]);
+			return usage(EXIT_FAILURE);
+		}
+	}
+
+
+	set_ta_path();
+
+	if (plugin_load_all() != 0) {
+		EMSG("failed to load plugins");
+		exit(EXIT_FAILURE);
+	}
+
+	if (daemonize) {
+		if (pipe(pipefd) < 0) {
+			EMSG("pipe(): %s", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		e = make_daemon(pipefd);
+		if (e < 0) {
+			EMSG("make_daemon(): %d", e);
+			exit(EXIT_FAILURE);
+		}
 	}
 
 	if (dev) {
@@ -696,9 +886,13 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (daemonize && daemon(0, 0) < 0) {
-		EMSG("daemon(): %s", strerror(errno));
-		exit(EXIT_FAILURE);
+	if (daemonize) {
+		/* Release parent */
+		if (write(pipefd[1], "", 1) != 1) {
+			EMSG("write(): %s", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		close(pipefd[1]);
 	}
 
 	while (!arg.abort) {
@@ -743,19 +937,18 @@ void *tee_supp_param_to_va(struct tee_ioctl_param *param)
 	if (!tee_supp_param_is_memref(param))
 		return NULL;
 
-	end_offs = param->u.memref.size + param->u.memref.shm_offs;
-	if (end_offs < param->u.memref.size ||
-	    end_offs < param->u.memref.shm_offs)
+	end_offs = MEMREF_SIZE(param) + MEMREF_SHM_OFFS(param);
+	if (end_offs < MEMREF_SIZE(param) || end_offs < MEMREF_SHM_OFFS(param))
 		return NULL;
 
-	tshm = find_tshm(param->u.memref.shm_id);
+	tshm = find_tshm(MEMREF_SHM_ID(param));
 	if (!tshm)
 		return NULL;
 
 	if (end_offs > tshm->size)
 		return NULL;
 
-	return (uint8_t *)tshm->p + param->u.memref.shm_offs;
+	return (uint8_t *)tshm->p + MEMREF_SHM_OFFS(param);
 }
 
 void tee_supp_mutex_lock(pthread_mutex_t *mu)

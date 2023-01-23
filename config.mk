@@ -30,8 +30,19 @@ CFG_TEE_FS_PARENT_PATH ?= /data/tee
 CFG_TEE_CLIENT_LOG_FILE ?= $(CFG_TEE_FS_PARENT_PATH)/teec.log
 
 # CFG_TEE_CLIENT_LOAD_PATH
-#   The location of the client library file.
+#   Colon-separated list of paths where tee-supplicant loads TAs from.
+#   For example: CFG_TEE_CLIENT_LOAD_PATH ?= /lib:/vendor/lib
+#   Note that the TA files are typically in a sub-directory (see the
+#   --ta-dir option).
 CFG_TEE_CLIENT_LOAD_PATH ?= /lib
+
+# CFG_TEE_SUPP_PLUGINS
+#   Enable (y) or disable (n) TEE supplicant plugin support
+CFG_TEE_SUPP_PLUGINS ?= y
+
+# CFG_TEE_PLUGIN_LOAD_PATH
+#   The location of the user plugins
+CFG_TEE_PLUGIN_LOAD_PATH ?= /usr/lib/tee-supplicant/plugins/
 
 # CFG_TA_TEST_PATH
 #   Enable the tee test path.  When enabled, the supplicant will try
@@ -42,6 +53,16 @@ CFG_TA_TEST_PATH ?= n
 # CFG_GP_SOCKETS
 #   Enable Global Platform Sockets support
 CFG_GP_SOCKETS ?= y
+
+# CFG_TA_GPROF_SUPPORT
+#   Enable dumping gprof data, not used unless secure world decides
+#   to dump something
+CFG_TA_GPROF_SUPPORT ?= y
+
+# CFG_FTRACE_SUPPORT
+#   Enable dumping ftrace data, not used unless secure world decides
+#   to dump something
+CFG_FTRACE_SUPPORT ?= y
 
 # Default output directory.
 # May be absolute, or relative to the optee_client source directory.
@@ -55,10 +76,4 @@ OO := $(if $(filter /%,$(O)),$(O),$(CURDIR)/../$(O))
 #########################################################################
 
 # Check that settings are coherent.
-
-ifdef ARM_TOOLCHAIN_DIR
-ifeq ($(wildcard ${ARM_TOOLCHAIN_DIR}/bin/${ARM_GCC_PREFIX}-gcc),)
-  $(error "ARM_TOOLCHAIN_DIR wrongly setup. Is ${ARM_TOOLCHAIN_DIR}")
-endif
-endif
 

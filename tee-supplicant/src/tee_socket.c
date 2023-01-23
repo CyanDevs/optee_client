@@ -57,6 +57,20 @@
 #endif
 #include <linux/tee.h>
 
+/*
+ * Used when checking how much data we have queued.
+ *
+ * For SOCK_DGRAM we try to be accurate up to 4096 bytes as
+ * that's our arbitrary chosen sensible upper size (with
+ * some margin). Larger size doesn't make much sense since
+ * anything larger than the MTU is bound to cause trouble
+ * on a congested network.
+ *
+ * For SOCK_STREAM we chose the same upper limit for
+ * simplicity. It doesn't matter if there's more queued,
+ * no data will be lost.
+ */
+#define SUPP_MAX_PEEK_LEN 4096
 
 struct sock_instance {
 	uint32_t id;
@@ -262,13 +276,13 @@ static TEEC_Result tee_socket_open(size_t num_params,
 	    !chk_pt(params + 3, TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	instance_id = params[0].u.value.b;
-	port = params[1].u.value.a;
-	protocol = params[1].u.value.b;
-	ip_vers = params[1].u.value.c;
+	instance_id = params[0].b;
+	port = params[1].a;
+	protocol = params[1].b;
+	ip_vers = params[1].c;
 
 	server = tee_supp_param_to_va(params + 2);
-	if (!server || server[params[2].u.memref.size - 1] != '\0')
+	if (!server || server[MEMREF_SIZE(params + 2) - 1] != '\0')
 		return TEE_ISOCKET_ERROR_HOSTNAME;
 
 	res = sock_connect(ip_vers, protocol, server, port, &fd);
@@ -281,7 +295,7 @@ static TEEC_Result tee_socket_open(size_t num_params,
 		return TEEC_ERROR_OUT_OF_MEMORY;
 	}
 
-	params[3].u.value.a = handle;
+	params[3].a = handle;
 	return TEEC_SUCCESS;
 }
 
@@ -296,8 +310,8 @@ static TEEC_Result tee_socket_close(size_t num_params,
 	    !chk_pt(params + 0, TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	instance_id = params[0].u.value.b;
-	handle = params[0].u.value.c;
+	instance_id = params[0].b;
+	handle = params[0].c;
 	fd = sock_handle_to_fd(instance_id, handle);
 	if (fd < 0)
 		return TEEC_ERROR_BAD_PARAMETERS;
@@ -329,7 +343,7 @@ static TEEC_Result tee_socket_close_all(size_t num_params,
 	    !chk_pt(params + 0, TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	instance_id = params[0].u.value.b;
+	instance_id = params[0].b;
 	sock_lock();
 	si = sock_instance_find(instance_id);
 	if (si)
@@ -465,18 +479,43 @@ static TEEC_Result tee_socket_send(size_t num_params,
 	    !chk_pt(params + 2, TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	instance_id = params[0].u.value.b;
-	handle = params[0].u.value.c;
+	instance_id = params[0].b;
+	handle = params[0].c;
 	fd = sock_handle_to_fd(instance_id, handle);
 	if (fd < 0)
 		return TEEC_ERROR_BAD_PARAMETERS;
 
 	buf = tee_supp_param_to_va(params + 1);
-	bytes = params[1].u.memref.size;
-	res = write_with_timeout(fd, buf, &bytes, params[2].u.value.a);
+	bytes = MEMREF_SIZE(params + 1);
+	res = write_with_timeout(fd, buf, &bytes, params[2].a);
 	if (res == TEEC_SUCCESS)
-		params[2].u.value.b = bytes;
+		params[2].b = bytes;
 	return res;
+}
+
+static ssize_t recv_with_out_flags(int fd, void *buf, size_t len, int inflags,
+				   int *out_flags)
+{
+	ssize_t r = 0;
+
+	while (true) {
+		struct iovec iov = { .iov_base = buf, .iov_len = len, };
+		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, };
+
+		r = recvmsg(fd, &msg, inflags);
+		if (r < 0) {
+			/*
+			 * If the syscall was just interrupted by a signal
+			 * delivery, try again.
+			 */
+			if (errno == EINTR)
+				continue;
+			return r;
+		}
+
+		*out_flags = msg.msg_flags;
+		return r;
+	}
 }
 
 static TEEC_Result read_with_timeout(int fd, void *buf, size_t *blen,
@@ -484,20 +523,83 @@ static TEEC_Result read_with_timeout(int fd, void *buf, size_t *blen,
 {
 	TEEC_Result res = TEEC_ERROR_GENERIC;
 	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	int socktype = 0;
+	socklen_t l = sizeof(socktype);
+	size_t peek_len = 0;
+	int out_flags = 0;
 	ssize_t r = 0;
+	int e = 0;
 
-	res = poll_with_timeout(&pfd, 1, timeout);
-	if (res != TEEC_SUCCESS)
-		return res;
-
-	r = read(fd, buf, *blen);
-	if (r == -1) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-			return TEE_ISOCKET_ERROR_TIMEOUT;
+	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socktype, &l))
 		return TEEC_ERROR_BAD_PARAMETERS;
+
+	if (*blen) {
+		/* If *blen == 0, the timeout parameter has no effect. */
+		res = poll_with_timeout(&pfd, 1, timeout);
+		if (res != TEEC_SUCCESS)
+			return res;
 	}
-	*blen = r;
+
+	if ((socktype == SOCK_DGRAM && *blen < SUPP_MAX_PEEK_LEN) || !*blen) {
+		/* Check how much data we have queued. */
+		void *b = malloc(SUPP_MAX_PEEK_LEN);
+
+		if (!b)
+			return TEEC_ERROR_OUT_OF_MEMORY;
+		r = recv_with_out_flags(fd, b, SUPP_MAX_PEEK_LEN,
+					MSG_PEEK | MSG_DONTWAIT, &out_flags);
+		e = errno;
+		free(b);
+		if (r < 0)
+			goto err;
+
+		/*
+		 * If the message was truncated we know that it's at least
+		 * one byte larger.
+		 */
+		if (out_flags & MSG_TRUNC)
+			r++;
+
+		if (!*blen) {
+			*blen = r;
+			return TEEC_SUCCESS;
+		}
+
+		peek_len = r;
+	}
+
+	r = recv_with_out_flags(fd, buf, *blen, MSG_DONTWAIT, &out_flags);
+	if (r == -1) {
+		e = errno;
+		goto err;
+	}
+	if (socktype == SOCK_DGRAM && (out_flags & MSG_TRUNC)) {
+		/*
+		 * The datagram has been truncated, return the best length
+		 * we have to indicate that.
+		 */
+		if (peek_len > (size_t)r)
+			*blen = peek_len;
+		else
+			*blen = r + 1;
+	} else {
+		*blen = r;
+	}
 	return TEEC_SUCCESS;
+
+err:
+	if (e == EAGAIN || e == EWOULDBLOCK) {
+		/*
+		 * If *blen is supplied as 0 then we're not supposed wait
+		 * for data so the call to poll has been skipped. In case
+		 * there is no data available recvmsg() will return an
+		 * error with errno set to EAGAIN or EWOULDBLOCK.
+		 */
+		if (!*blen)
+			return TEEC_SUCCESS;
+		return TEE_ISOCKET_ERROR_TIMEOUT;
+	}
+	return TEEC_ERROR_BAD_PARAMETERS;
 }
 
 static TEEC_Result tee_socket_recv(size_t num_params,
@@ -516,18 +618,18 @@ static TEEC_Result tee_socket_recv(size_t num_params,
 	    !chk_pt(params + 2, TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	instance_id = params[0].u.value.b;
-	handle = params[0].u.value.c;
+	instance_id = params[0].b;
+	handle = params[0].c;
 	fd = sock_handle_to_fd(instance_id, handle);
 	if (fd < 0)
 		return TEEC_ERROR_BAD_PARAMETERS;
 
 	buf = tee_supp_param_to_va(params + 1);
 
-	bytes = params[1].u.memref.size;
-	res = read_with_timeout(fd, buf, &bytes, params[2].u.value.a);
+	bytes = MEMREF_SIZE(params + 1);
+	res = read_with_timeout(fd, buf, &bytes, params[2].a);
 	if (res == TEEC_SUCCESS)
-		params[1].u.memref.size = bytes;
+		MEMREF_SIZE(params + 1) = bytes;
 
 	return res;
 }
@@ -692,9 +794,9 @@ static TEEC_Result tee_socket_ioctl(size_t num_params,
 	    !chk_pt(params + 2, TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	instance_id = params[0].u.value.b;
-	handle = params[0].u.value.c;
-	command = params[2].u.value.a;
+	instance_id = params[0].b;
+	handle = params[0].c;
+	command = params[2].a;
 	fd = sock_handle_to_fd(instance_id, handle);
 	if (fd < 0)
 		return TEEC_ERROR_BAD_PARAMETERS;
@@ -707,14 +809,14 @@ static TEEC_Result tee_socket_ioctl(size_t num_params,
 
 	switch (socktype) {
 	case SOCK_STREAM:
-		sz = params[1].u.memref.size;
+		sz = MEMREF_SIZE(params + 1);
 		res = tee_socket_ioctl_tcp(fd, command, buf, &sz);
-		params[1].u.memref.size = sz;
+		MEMREF_SIZE(params + 1) = sz;
 		return res;
 	case SOCK_DGRAM:
-		sz = params[1].u.memref.size;
+		sz = MEMREF_SIZE(params + 1);
 		res = tee_socket_ioctl_udp(fd, command, buf, &sz);
-		params[1].u.memref.size = sz;
+		MEMREF_SIZE(params + 1) = sz;
 		return res;
 	default:
 		return TEEC_ERROR_BAD_PARAMETERS;
@@ -727,7 +829,7 @@ TEEC_Result tee_socket_process(size_t num_params,
 	if (!num_params || !tee_supp_param_is_value(params))
 		return TEEC_ERROR_BAD_PARAMETERS;
 
-	switch (params->u.value.a) {
+	switch (params->a) {
 	case OPTEE_MRC_SOCKET_OPEN:
 		return tee_socket_open(num_params, params);
 	case OPTEE_MRC_SOCKET_CLOSE:

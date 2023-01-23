@@ -16,11 +16,11 @@ SBINDIR ?= /usr/sbin
 LIBDIR ?= /usr/lib
 INCLUDEDIR ?= /usr/include
 
-CFG_TA_GPROF_SUPPORT ?= n
-CFG_TA_FTRACE_SUPPORT ?= n
+WITH_TEEACL ?= 1
 
-.PHONY: all build build-libteec install copy_export \
-	clean cscope clean-cscope \
+.PHONY: all build build-libteec build-libckteec build-libseteec \
+	build-libteeacl install copy_export clean cscope \
+	clean-cscope \
 	checkpatch-pre-req checkpatch-modified-patch checkpatch-modified-file \
 	checkpatch-last-commit-patch checkpatch-last-commit-file \
 	checkpatch-base-commit-patch checkpatch-base-commit-file \
@@ -33,22 +33,49 @@ build-libteec:
 	@$(MAKE) --directory=libteec --no-print-directory --no-builtin-variables \
 			CFG_TEE_BENCHMARK=$(CFG_TEE_BENCHMARK) CFG_TEE_CLIENT_LOG_LEVEL=$(CFG_TEE_CLIENT_LOG_LEVEL)
 
-
 build-tee-supplicant: build-libteec
 	@echo "Building tee-supplicant"
 	$(MAKE) --directory=tee-supplicant  --no-print-directory --no-builtin-variables CFG_TEE_SUPP_LOG_LEVEL=$(CFG_TEE_SUPP_LOG_LEVEL)
 
-build: build-libteec build-tee-supplicant
+build: build-libteec build-tee-supplicant build-libckteec build-libseteec
+ifeq ($(WITH_TEEACL),1)
+build: build-libteeacl
+endif
+
+build-libckteec: build-libteec
+	@echo "Building libckteec.so"
+	@$(MAKE) --directory=libckteec --no-print-directory --no-builtin-variables
+
+build-libseteec: build-libteec
+	@echo "Building libseteec.so"
+	@$(MAKE) --directory=libseteec --no-print-directory --no-builtin-variables
+
+build-libteeacl:
+	@echo "Building libteeacl.so"
+	@$(MAKE) --directory=libteeacl --no-print-directory --no-builtin-variables
 
 install: copy_export
 
-clean: clean-libteec clean-tee-supplicant clean-cscope
+clean: clean-libteec clean-tee-supplicant clean-cscope clean-libckteec \
+	clean-libseteec
+ifeq ($(WITH_TEEACL),1)
+clean: clean-libteeacl
+endif
 
 clean-libteec:
 	@$(MAKE) --directory=libteec --no-print-directory clean
 
 clean-tee-supplicant:
 	@$(MAKE) --directory=tee-supplicant --no-print-directory clean
+
+clean-libckteec:
+	@$(MAKE) --directory=libckteec --no-print-directory clean
+
+clean-libseteec:
+	@$(MAKE) --directory=libseteec --no-print-directory clean
+
+clean-libteeacl:
+	@$(MAKE) --directory=libteeacl --no-print-directory clean
 
 cscope:
 	@echo "  CSCOPE"
@@ -126,7 +153,19 @@ distclean: clean
 
 copy_export: build
 	mkdir -p $(DESTDIR)$(SBINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
-	cp -a ${O}/libteec/libteec.so* $(DESTDIR)$(LIBDIR)
-	cp -a ${O}/libteec/libteec.a $(DESTDIR)$(LIBDIR)
+	cp config.mk $(DESTDIR)/$(INCLUDEDIR)/optee_client_config.mk
+	cp -d ${O}/libteec/libteec.so* $(DESTDIR)$(LIBDIR)
+	cp -d ${O}/libteec/libteec.a $(DESTDIR)$(LIBDIR)
 	cp ${O}/tee-supplicant/tee-supplicant $(DESTDIR)$(SBINDIR)
 	cp public/*.h $(DESTDIR)$(INCLUDEDIR)
+	cp libckteec/include/*.h $(DESTDIR)$(INCLUDEDIR)
+	cp -d ${O}/libckteec/libckteec.so* $(DESTDIR)$(LIBDIR)
+	cp -d ${O}/libckteec/libckteec.a $(DESTDIR)$(LIBDIR)
+ifeq ($(WITH_TEEACL),1)
+	cp libteeacl/include/*.h $(DESTDIR)$(INCLUDEDIR)
+	cp -d ${O}/libteeacl/libteeacl.so* $(DESTDIR)$(LIBDIR)
+	cp -d ${O}/libteeacl/libteeacl.a $(DESTDIR)$(LIBDIR)
+endif
+	cp libseteec/include/*.h $(DESTDIR)$(INCLUDEDIR)
+	cp -d ${O}/libseteec/libseteec.so* $(DESTDIR)$(LIBDIR)
+	cp -d ${O}/libseteec/libseteec.a $(DESTDIR)$(LIBDIR)

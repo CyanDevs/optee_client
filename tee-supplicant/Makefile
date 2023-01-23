@@ -3,8 +3,8 @@ include ../config.mk
 
 OUT_DIR := $(OO)/tee-supplicant
 
-# Emulate RPMB ioctl's
-RPMB_EMU	:= 1
+# Emulate RPMB ioctl's by default
+RPMB_EMU	?= 1
 
 .PHONY: all tee-supplicant clean
 
@@ -20,7 +20,6 @@ TEES_SRCS	:= tee_supplicant.c \
 		   rpmb.c \
 		   handle.c
 
-
 ifeq ($(CFG_GP_SOCKETS),y)
 TEES_SRCS 	+= tee_socket.c
 endif
@@ -28,8 +27,12 @@ endif
 ifeq ($(RPMB_EMU),1)
 TEES_SRCS	+= sha2.c hmac_sha2.c
 endif
-ifneq (,$(filter y,$(CFG_TA_GPROF_SUPPORT) $(CFG_TA_FTRACE_SUPPORT)))
+ifneq (,$(filter y,$(CFG_TA_GPROF_SUPPORT) $(CFG_FTRACE_SUPPORT)))
 TEES_SRCS	+= prof.c
+endif
+
+ifeq ($(CFG_TEE_SUPP_PLUGINS),y)
+TEES_SRCS 	+= plugin.c
 endif
 
 TEES_SRC_DIR	:= src
@@ -43,7 +46,7 @@ TEES_CFLAGS	:= $(addprefix -I, $(TEES_INCLUDES)) $(CFLAGS) \
 		   -DDEBUGLEVEL_$(CFG_TEE_SUPP_LOG_LEVEL) \
 		   -DBINARY_PREFIX=\"TEES\" \
 		   -DTEE_FS_PARENT_PATH=\"$(CFG_TEE_FS_PARENT_PATH)\" \
-		   -DTEEC_LOAD_PATH=\"$(CFG_TEE_CLIENT_LOAD_PATH)\"
+		   -DTEEC_LOAD_PATH=\"$(CFG_TEE_CLIENT_LOAD_PATH)\" \
 
 ifeq ($(CFG_GP_SOCKETS),y)
 TEES_CFLAGS	+= -DCFG_GP_SOCKETS=1
@@ -61,13 +64,25 @@ ifeq ($(CFG_TA_GPROF_SUPPORT),y)
 TEES_CFLAGS	+= -DCFG_TA_GPROF_SUPPORT
 endif
 
-ifeq ($(CFG_TA_FTRACE_SUPPORT),y)
-TEES_CFLAGS	+= -DCFG_TA_FTRACE_SUPPORT
+ifeq ($(CFG_FTRACE_SUPPORT),y)
+TEES_CFLAGS	+= -DCFG_FTRACE_SUPPORT
+endif
+
+ifeq ($(CFG_TEE_SUPP_PLUGINS),y)
+TEES_CFLAGS	+= -DTEE_SUPP_PLUGINS \
+		   -DTEE_PLUGIN_LOAD_PATH=\"$(CFG_TEE_PLUGIN_LOAD_PATH)\"
 endif
 
 TEES_LFLAGS	+= -lpthread
 # Needed to get clock_gettime() for for glibc versions before 2.17
 TEES_LFLAGS	+= -lrt
+
+ifeq ($(CFG_TEE_SUPP_PLUGINS),y)
+# Needed to dynamically load user plugins
+TEES_LFLAGS	+= -ldl
+# Needed for dlopen()
+TEES_LFLAGS 	+= -Wl,-rpath=$(CFG_TEE_PLUGIN_LOAD_PATH)
+endif
 
 tee-supplicant: $(TEES_FILE)
 

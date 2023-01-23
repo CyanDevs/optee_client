@@ -1,6 +1,6 @@
-project(libteec C)
-
-set(PROJECT_VERSION "1.0.0")
+project(libteec
+	VERSION 1.0.0
+	LANGUAGES C)
 
 ################################################################################
 # Packages
@@ -35,9 +35,12 @@ endif()
 ################################################################################
 add_library (teec ${SRC})
 
+set(libteectgt teec)
+configure_file(libteec.pc.in libteec.pc @ONLY)
+
 set_target_properties (teec PROPERTIES
 	VERSION ${PROJECT_VERSION}
-	SOVERSION 1
+	SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
 ################################################################################
@@ -45,7 +48,7 @@ set_target_properties (teec PROPERTIES
 ################################################################################
 target_compile_definitions (teec
 	PRIVATE -D_GNU_SOURCE
-	PRIVATE -DCFG_TEE_CLIENT_LOG_LEVEL=${CFG_TEE_CLIENT_LOG_LEVEL}
+	PRIVATE -DDEBUGLEVEL_${CFG_TEE_CLIENT_LOG_LEVEL}
 	PRIVATE -DTEEC_LOG_FILE="${CFG_TEE_CLIENT_LOG_FILE}"
 	PRIVATE -DBINARY_PREFIX="LT"
 )
